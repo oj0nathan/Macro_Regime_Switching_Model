@@ -125,7 +125,3 @@ Daily adjusted close prices are resampled to **month-end** and converted into si
 This repository is for **educational and research purposes only**.
 Nothing here constitutes investment advice or an offer to buy or sell any security.
 
----
-
-You can now paste this into `README.md` and tweak any wording, numbers, or file paths to match your repo.
-
