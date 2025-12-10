@@ -1,5 +1,7 @@
 # Macro Regime-Switching Model for Multi-Asset Allocation
 
+Streamlit Dashboard: https://macroregimeswitchingmodel-rzlhm7tgpmfxv2f5umjsak.streamlit.app/
+
 This project tests whether a **small set of macroeconomic indicators** can systematically improve multi-asset allocation decisions. I build a Hidden Markov Model (HMM) on U.S. growth and inflation, map the latent states into intuitive macro regimes (crisis, stagnation, expansion, boom), and then run a **regime-aware backtest** on a simple 5-asset universe (SPY, TLT, HYG, DBC, GLD).
 
 The code is written in Python using `pandas`, `NumPy`, `statsmodels`, `pandas_datareader`, `yfinance`, and `matplotlib`, and is implemented end-to-end in a Jupyter notebook.
