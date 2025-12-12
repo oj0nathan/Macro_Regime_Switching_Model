@@ -1,5 +1,3 @@
-# src/pipeline.py
-
 import numpy as np
 import pandas as pd
 from pandas_datareader import data as fred
@@ -7,18 +5,19 @@ from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
 import yfinance as yf
 
 # Global settings / defaults
-
 START_MACRO = "1970-01-01"
 START_ASSETS = "2007-05-01"
 ASSET_LIST = ["SPY", "TLT", "HYG", "DBC", "GLD"]
 
+# End of training sample for HMM estimation / model selection
+# This is to conduct in-sample and out-of-sample
+TRAIN_END = "2006-12-31"
+
 
 # MACRO DATA & HMM
-
-def fetch_macro_data(start_date=START_MACRO, end_date=None):
+def fetch_macro_data(start_date: str = START_MACRO, end_date: str | None = None) -> pd.DataFrame:
     """
     Fetch macro data from FRED and build Growth and Inflation proxies.
-
     - Growth proxy: Industrial Production (INDPRO) YoY % change
     - Inflation proxy: CPI (CPIAUCSL) YoY % change
     """
@@ -34,10 +33,10 @@ def fetch_macro_data(start_date=START_MACRO, end_date=None):
     return macro_data
 
 
-def fit_growth_regime_model(macro_data, k_list=(3, 4)):
+def fit_growth_regime_model(macro_data: pd.DataFrame, k_list: tuple[int, ...] = (3, 4)):
     """
-    Fit a Markov-switching regression (Gaussian HMM) on Growth YoY.
-    Returns the best statsmodels result object (by BIC).
+    Original "fit on full sample" version (kept for reference / experimentation).
+    Not used in the strict train/test pipeline, but handy for a fully in-sample structural model.
     """
     growth_series = macro_data["growth_yoy"].astype(float)
 
@@ -71,11 +70,82 @@ def fit_growth_regime_model(macro_data, k_list=(3, 4)):
     if best_result is None:
         raise RuntimeError("All candidate regime models failed to converge.")
 
-    print(f"Selected {best_k}-regime model (BIC={best_bic:.2f})")
+    print(f"[FULL] Selected {best_k}-regime model (BIC={best_bic:.2f})")
     return best_result
 
 
-def attach_regime_probabilities(macro_data, model_result):
+def fit_growth_regime_model_train_test(
+    macro_data: pd.DataFrame,
+    train_end: str = TRAIN_END,
+    k_list: tuple[int, ...] = (3, 4),
+):
+    """
+    Train/test-aware HMM fitting:
+
+    1) Use data up to train_end to:
+         - choose k (number of regimes) by BIC
+         - estimate HMM parameters
+    2) Freeze those parameters and run the model on the *full* sample
+       (1970–present) to obtain smoothed / filtered probabilities.
+    """
+
+    # Full and train slices of growth series
+    growth_full = macro_data["growth_yoy"].astype(float)
+    growth_train = growth_full.loc[:train_end]
+
+    if growth_train.empty:
+        raise ValueError("Training sample is empty – check TRAIN_END date.")
+
+    best_result = None
+    best_k = None
+    best_bic = np.inf
+
+    # Step 1: fit on TRAIN sample only
+    for k in k_list:
+        try:
+            model_train = MarkovRegression(
+                endog=growth_train,
+                k_regimes=k,
+                trend="c",
+                switching_variance=True,
+            )
+
+            result_train = model_train.fit(
+                maxiter=1000,
+                em_iter=20,
+                search_reps=50,
+                disp=False,
+            )
+
+            if result_train.bic < best_bic:
+                best_bic = result_train.bic
+                best_result = result_train
+                best_k = k
+        except Exception as e:
+            print(f"Failed to fit {k}-regime TRAIN model: {e}")
+
+    if best_result is None:
+        raise RuntimeError("All candidate TRAIN models failed to converge.")
+
+    print(
+        f"[TRAIN] Selected {best_k}-regime model on "
+        f"{growth_train.index[0].date()}–{train_end} (BIC={best_bic:.2f})"
+    )
+
+    # Step 2: apply the trained parameters to the FULL series
+    full_model = MarkovRegression(
+        endog=growth_full,
+        k_regimes=best_k,
+        trend="c",
+        switching_variance=True,
+    )
+    # Only smooth using the parameters from the TRAIN fit (no re-estimation)
+    full_result = full_model.smooth(best_result.params)
+
+    return best_result, full_result, best_k
+
+
+def attach_regime_probabilities(macro_data: pd.DataFrame, model_result):
     """
     Attach smoothed and filtered regime probabilities to the macro data.
 
@@ -88,6 +158,7 @@ def attach_regime_probabilities(macro_data, model_result):
     macro_with_regimes = macro_data.join(smoothed_df, how="left")
     macro_with_regimes = macro_with_regimes.join(filtered_df, how="left")
 
+    # Most likely regime per month (using smoothed probabilities – ex post view)
     macro_with_regimes["Regime"] = (
         smoothed_df.idxmax(axis=1).str.replace("Regime_", "").astype(int)
     )
@@ -95,7 +166,7 @@ def attach_regime_probabilities(macro_data, model_result):
     return macro_with_regimes, smoothed_df, filtered_df
 
 
-def summarise_and_order_regimes(macro_regime_df):
+def summarise_and_order_regimes(macro_regime_df: pd.DataFrame):
     """
     Summarise each regime's average Growth and Inflation,
     then impose a systematic ordering by Growth (low -> high).
@@ -104,6 +175,7 @@ def summarise_and_order_regimes(macro_regime_df):
         ["mean", "std"]
     )
 
+    # Order by mean growth (Crisis -> Stagnation -> Expansion -> Boom)
     summary_sorted = summary.sort_values(by=("growth_yoy", "mean"))
 
     ordered_regime_indices = list(summary_sorted.index)
@@ -118,7 +190,7 @@ def summarise_and_order_regimes(macro_regime_df):
     return macro_ordered, summary_sorted, regime_order_map
 
 
-def add_regime_names(macro_regime_df):
+def add_regime_names(macro_regime_df: pd.DataFrame):
     """
     Map ordered regime indices to human-readable macro regime names.
     """
@@ -134,12 +206,12 @@ def add_regime_names(macro_regime_df):
 
     return df, regime_name_map
 
-
 # ASSET RETURNS & ALIGNMENT
-
 def fetch_monthly_asset_returns(
-    start_date=START_ASSETS, end_date=None, tickers=ASSET_LIST
-):
+    start_date: str = START_ASSETS,
+    end_date: str | None = None,
+    tickers: list[str] = ASSET_LIST,
+) -> pd.DataFrame:
     """
     Fetch daily prices for the macro asset universe from Yahoo Finance,
     then convert them into monthly simple returns (Adj Close).
@@ -162,7 +234,11 @@ def fetch_monthly_asset_returns(
     return monthly_returns
 
 
-def align_returns_with_regimes(asset_returns, macro_regime_df, regime_col="RegimeOrdered"):
+def align_returns_with_regimes(
+    asset_returns: pd.DataFrame,
+    macro_regime_df: pd.DataFrame,
+    regime_col: str = "RegimeOrdered",
+):
     """
     Align monthly asset returns with monthly regime labels.
     """
@@ -181,7 +257,11 @@ def align_returns_with_regimes(asset_returns, macro_regime_df, regime_col="Regim
     return aligned_returns, aligned_regimes
 
 
-def compute_regime_performance(returns, regimes, rf_annual=0.0):
+def compute_regime_performance(
+    returns: pd.DataFrame,
+    regimes: pd.Series,
+    rf_annual: float = 0.0,
+) -> pd.DataFrame:
     """
     Compute annualised return, volatility and Sharpe by regime for each asset.
     """
@@ -221,17 +301,18 @@ def compute_regime_performance(returns, regimes, rf_annual=0.0):
 
 
 # REGIME WEIGHTS & BACKTEST
-
-DEFAULT_REGIME_WEIGHTS = {
-    0: {"DBC": 0.0, "GLD": 0.30, "HYG": 0.0, "SPY": 0.10, "TLT": 0.60},   # Crisis / Defensive
-    1: {"DBC": 0.10, "GLD": 0.20, "HYG": 0.30, "SPY": 0.40, "TLT": 0.0},  # Recovery / Risk-on
-    2: {"DBC": 0.10, "GLD": 0.10, "HYG": 0.20, "SPY": 0.30, "TLT": 0.30}, # Balanced / Goldilocks
-    3: {"DBC": 0.40, "GLD": 0.10, "HYG": 0.10, "SPY": 0.40, "TLT": 0.0},  # Inflation / Boom
+DEFAULT_REGIME_WEIGHTS: dict[int, dict[str, float]] = {
+    0: {"DBC": 0.0,  "GLD": 0.30, "HYG": 0.0,  "SPY": 0.10, "TLT": 0.60},  # Crisis
+    1: {"DBC": 0.10, "GLD": 0.20, "HYG": 0.30, "SPY": 0.40, "TLT": 0.0},  # Stagnation / recovery
+    2: {"DBC": 0.10, "GLD": 0.10, "HYG": 0.20, "SPY": 0.30, "TLT": 0.30},  # Goldilocks
+    3: {"DBC": 0.40, "GLD": 0.10, "HYG": 0.10, "SPY": 0.40, "TLT": 0.0},  # Boom / overheating
 }
 
 
 def build_filtered_regime_column(
-    macro_with_regimes_named, regime_order_map, filt_prefix="FiltRegime_"
+    macro_with_regimes_named: pd.DataFrame,
+    regime_order_map: dict[int, int],
+    filt_prefix: str = "FiltRegime_",
 ):
     """
     Use filtered probabilities (real-time) and map to ordered regime indices.
@@ -239,6 +320,7 @@ def build_filtered_regime_column(
     df = macro_with_regimes_named.copy()
     filt_cols = [c for c in df.columns if c.startswith(filt_prefix)]
 
+    # Raw regime index based on max filtered probability (real-time)
     df["RegimeFiltRaw"] = (
         df[filt_cols].idxmax(axis=1).str.replace(filt_prefix, "").astype(int)
     )
@@ -248,13 +330,13 @@ def build_filtered_regime_column(
 
 
 def run_regime_backtest(
-    returns,
-    regimes,
-    regime_weights=DEFAULT_REGIME_WEIGHTS,
+    returns: pd.DataFrame,
+    regimes: pd.Series,
+    regime_weights: dict[int, dict[str, float]] = DEFAULT_REGIME_WEIGHTS,
 ):
     """
     Simulates a portfolio that changes weights based on the macro regime.
-    Uses lagged regime signal to avoid look-ahead.
+    Uses lagged filtered regime signal to avoid look-ahead.
     """
     signal = regimes.shift(1).dropna()
 
@@ -263,7 +345,7 @@ def run_regime_backtest(
     active_sig = signal.loc[common_idx]
 
     n_assets = len(returns.columns)
-    benchmark_ret = active_ret.mean(axis=1)
+    benchmark_ret = active_ret.mean(axis=1)  # naive equal-weight benchmark
 
     strategy_returns = []
 
@@ -272,7 +354,7 @@ def run_regime_backtest(
 
         weights_dict = regime_weights.get(
             current_regime,
-            {col: 1 / n_assets for col in returns.columns},
+            {col: 1 / n_assets for col in returns.columns},  # fallback: equal-weight
         )
         w_vector = np.array(
             [weights_dict.get(col, 0.0) for col in active_ret.columns]
@@ -291,8 +373,12 @@ def run_regime_backtest(
     return backtest_df
 
 
-def calculate_final_metrics(backtest_df):
+def calculate_final_metrics(backtest_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Summary performance table for Strategy vs Benchmark.
+    """
     stats = {}
+
     for col in ["Strategy", "Benchmark"]:
         series = backtest_df[col]
         cum_ret = (1 + series).cumprod()
@@ -308,10 +394,15 @@ def calculate_final_metrics(backtest_df):
             "Sharpe": f"{sharpe:.2f}",
             "Max Drawdown": f"{max_dd * 100:.1f}%",
         }
+
     return pd.DataFrame(stats)
 
 
-def analyze_strategy_by_regime(backtest_df, regime_signal, regime_names):
+def analyze_strategy_by_regime(
+    backtest_df: pd.DataFrame,
+    regime_signal: pd.Series,
+    regime_names: dict[int, str],
+) -> pd.DataFrame:
     """
     Decomposes the Strategy vs Benchmark performance by Macro Regime.
     """
@@ -350,9 +441,13 @@ def analyze_strategy_by_regime(backtest_df, regime_signal, regime_names):
     return pd.DataFrame(results)
 
 
-def compute_regime_correlations(returns, regimes, regime_names):
+def compute_regime_correlations(
+    returns: pd.DataFrame,
+    regimes: pd.Series,
+    regime_names: dict[int, str],
+) -> pd.DataFrame:
     """
-    Calculates key correlations by regime.
+    Calculates key correlations by regime (e.g. SPY–TLT, SPY–DBC, TLT–DBC).
     """
     df = returns.copy()
     df["Regime"] = regimes
@@ -363,6 +458,7 @@ def compute_regime_correlations(returns, regimes, regime_names):
     for r_id in sorted(df["Regime"].unique()):
         subset = df[df["Regime"] == r_id].drop(columns=["Regime"])
         corr = subset.corr()
+
         results.append(
             {
                 "Regime": regime_names.get(r_id, f"Regime {r_id}"),
@@ -374,27 +470,39 @@ def compute_regime_correlations(returns, regimes, regime_names):
 
     return pd.DataFrame(results)
 
-
 # CONVENIENCE PIPELINE WRAPPER
-
-def run_full_pipeline(k_list=(3, 4), rf_annual=0.0):
+def run_full_pipeline(
+    k_list: tuple[int, ...] = (3, 4),
+    rf_annual: float = 0.0,
+    train_end: str = TRAIN_END,
+):
     """
     Runs the full pipeline:
+
         - Fetch macro
-        - Fit HMM
+        - Fit HMM on TRAIN sample only (1970–train_end)
+        - Apply trained parameters to FULL macro sample (1970–present)
         - Attach & order regimes
         - Name regimes
         - Fetch assets
         - Align returns
-        - Compute stats
+        - Compute per-regime stats
         - Build filtered (real-time) regime column
         - Run backtest & attribution
-    Returns a dictionary of key DataFrames.
+
+    Returns a dictionary of key DataFrames / objects.
     """
+    # 1. Macro + HMM
     macro_data = fetch_macro_data()
-    regime_model_result = fit_growth_regime_model(macro_data, k_list=k_list)
+
+    regime_train_result, regime_full_result, best_k = fit_growth_regime_model_train_test(
+        macro_data,
+        train_end=train_end,
+        k_list=k_list,
+    )
+
     macro_with_regimes, smoothed_probs, filtered_probs = attach_regime_probabilities(
-        macro_data, regime_model_result
+        macro_data, regime_full_result
     )
 
     macro_with_regimes_ordered, regime_summary, regime_order_map = (
@@ -404,6 +512,7 @@ def run_full_pipeline(k_list=(3, 4), rf_annual=0.0):
         macro_with_regimes_ordered
     )
 
+    # 2. Assets + alignment (structural, using smoothed/ordered regimes)
     asset_returns = fetch_monthly_asset_returns()
     aligned_returns, aligned_regimes = align_returns_with_regimes(
         asset_returns, macro_with_regimes_named, "RegimeOrdered"
@@ -413,7 +522,7 @@ def run_full_pipeline(k_list=(3, 4), rf_annual=0.0):
         aligned_returns, aligned_regimes, rf_annual=rf_annual
     )
 
-    # Build filtered (real-time) regimes for trading backtest
+    # 3. Build filtered (real-time) regimes for trading backtest
     macro_with_regimes_named = build_filtered_regime_column(
         macro_with_regimes_named, regime_order_map
     )
@@ -421,6 +530,7 @@ def run_full_pipeline(k_list=(3, 4), rf_annual=0.0):
         asset_returns, macro_with_regimes_named, "RegimeOrderedFilt"
     )
 
+    # 4. Backtest + attribution
     backtest_results = run_regime_backtest(
         aligned_returns_trading, aligned_regimes_trading, DEFAULT_REGIME_WEIGHTS
     )
@@ -436,6 +546,9 @@ def run_full_pipeline(k_list=(3, 4), rf_annual=0.0):
 
     return {
         "macro_data": macro_data,
+        "regime_train_result": regime_train_result,
+        "regime_full_result": regime_full_result,
+        "best_k": best_k,
         "macro_with_regimes": macro_with_regimes,
         "macro_with_regimes_ordered": macro_with_regimes_ordered,
         "macro_with_regimes_named": macro_with_regimes_named,
